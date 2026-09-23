@@ -59,6 +59,7 @@ from proot_distro.commands.push import command_push
 from proot_distro.commands.ps import command_ps
 from proot_distro.commands.kill import command_kill
 from proot_distro.commands.search import command_search
+from proot_distro.commands.buster import command_buster
 
 
 _COMMAND_HANDLERS = {
@@ -79,6 +80,7 @@ _COMMAND_HANDLERS = {
     "ps":          command_ps,
     "kill":        command_kill,
     "search":      command_search,
+    "buster":      command_buster,
     "help":        command_help,
 }
 
@@ -186,7 +188,7 @@ def _ensure_proot_available(first_canonical: str) -> None:
     refusing to look up an image because the runtime for it is not
     installed yet would be backwards.
     """
-    if first_canonical in ("build", "push", "kill", "ps", "search"):
+    if first_canonical in ("build", "push", "kill", "ps", "search", "buster"):
         return
     ensure_proot_installed()
 

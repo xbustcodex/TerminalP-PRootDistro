@@ -967,6 +967,40 @@ HELP_PAGES = {
         ],
     },
 
+    "buster": {
+        "usage": "buster install|verify|login [OPTIONS]",
+        "summary": (
+            "Install and run a canonical Prime Tech Buster OS rootfs "
+            "through TerminalP's existing PRoot-Distro runtime. Buster "
+            "uses its own Debian userspace and package manager; it is "
+            "not a TerminalP or Android package environment."
+        ),
+        "options": [
+            ("-h, --help", "Show this help."),
+            ("--version [VERSION]", "Buster release version identity."),
+            ("--architecture [ARCH]", "Buster architecture, such as arm64."),
+            ("--sha256 [DIGEST]", "Required SHA-256 of the rootfs archive."),
+            ("--release-metadata [FILE]",
+             "Read version, architecture and SHA-256 from a published JSON metadata file."),
+        ],
+        "examples": [
+            f"{PROGRAM_NAME} buster install buster-v0.3.2-arm64.tar "
+                "--version 0.3.2 --architecture arm64 --sha256 DIGEST",
+            f"{PROGRAM_NAME} buster verify",
+            f"{PROGRAM_NAME} buster login",
+        ],
+        "footer": [{
+            "title": "PERSISTENCE AND LIMITATIONS",
+            "intro": (
+                "The versioned Buster rootfs is replaceable. Root and home "
+                "state are kept separately and are bound explicitly by the "
+                "launcher. PRoot fake-root is not Android root; mounts, "
+                "services, namespaces, devices and kernel facilities remain "
+                "subject to Android and PRoot limitations."
+            ),
+        }],
+    },
+
     "sync": {
         "usage": "sync [OPTIONS] [DIST:]SRC [DIST:]DEST",
         "summary": (
@@ -1037,4 +1071,5 @@ TOP_COMMANDS = [
     ("sync", "Sync files from/to container."),
     ("build", "Build an OCI image from a Dockerfile."),
     ("push", "Push a locally built image to a registry."),
+    ("buster", "Deploy and launch a canonical Buster OS rootfs."),
 ]

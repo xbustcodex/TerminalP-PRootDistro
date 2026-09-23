@@ -182,6 +182,7 @@ def build_parser() -> _PdArgumentParser:
     _run(sub)
     _ps(sub)
     _kill(sub)
+    _buster(sub)
 
     return parser
 
@@ -400,6 +401,18 @@ def _ps(sub):
     p = sub.add_parser("ps", add_help=False)
     p._pd_command = "ps"
     p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("-h", "--help", action="store_true")
+
+
+def _buster(sub):
+    p = sub.add_parser("buster", add_help=False)
+    p._pd_command = "buster"
+    p.add_argument("buster_action", choices=["install", "verify", "login"])
+    p.add_argument("archive", nargs="?")
+    p.add_argument("--version")
+    p.add_argument("--architecture")
+    p.add_argument("--sha256")
+    p.add_argument("--release-metadata", dest="release_metadata")
     p.add_argument("-h", "--help", action="store_true")
 
 
