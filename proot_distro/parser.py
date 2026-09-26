@@ -407,8 +407,9 @@ def _ps(sub):
 def _buster(sub):
     p = sub.add_parser("buster", add_help=False)
     p._pd_command = "buster"
-    p.add_argument("buster_action", choices=["install", "verify", "login"])
+    p.add_argument("buster_action", choices=["install", "verify", "login", "exec"])
     p.add_argument("archive", nargs="?")
+    p.add_argument("exec_args", nargs="*")
     p.add_argument("--version")
     p.add_argument("--architecture")
     p.add_argument("--sha256")

@@ -9,6 +9,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -40,6 +41,23 @@ _MAX_LINKS = 1_000_000
 _MAX_MEMBERS = 2_000_000
 _MAX_SYMLINK_HOPS = 40
 _MAX_ARCHIVE_BYTES = 64 * 1024 * 1024 * 1024
+_SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_EXEC_OPERATIONS = frozenset(
+    ("status", "services", "capabilities", "health", "ping")
+)
+_SERVICE_OPERATIONS = frozenset(
+    ("service-start", "service-restart", "service-status")
+)
+
+# TerminalP fork contract marker. TerminalP pins this literal in
+# scripts/bootstrap-aarch64.manifest and PRIMETECH_PACKAGE_BUILD_CONFIG.sh and
+# cross-checks it against the source it is about to build, so a payload that is
+# upstream termux/proot-distro -- which has no `buster` command and therefore no
+# exec dispatcher -- fails closed instead of shipping behind a PrimeTech pin.
+# The marker is necessary but not sufficient: TerminalP's package contract test
+# also exercises the parser and the dispatcher behaviourally, because a source
+# that merely mentions this string is still not a source that accepts `exec`.
+FORK_MARKER = "TERMINALP_PROOT_DISTRO_BUSTER_EXEC"
 
 # link(2), when the interpreter has it at all. Termux/Android CPython is
 # built without os.link, so the attribute is *absent* rather than failing
@@ -535,7 +553,7 @@ def _prepare_rootfs(root: Path, arch: str):
     rootfs_helpers.write_resolv_conf(str(root))
 
 
-def _validate_rootfs(root: Path, arch: str):
+def _validate_rootfs(root: Path, arch: str, root_fd=None):
     """Validate active rootfs structure and explicit device architecture."""
     if _ARCH_MAP.get(get_device_cpu_arch()) != arch:
         raise RuntimeError(
@@ -544,13 +562,42 @@ def _validate_rootfs(root: Path, arch: str):
         )
     required = ("usr", "etc", "var", "tmp", "run", "dev", "proc",
                 "sys", "home", "root")
-    missing = [name for name in required if not os.path.lexists(root / name)]
+    if root_fd is None:
+        entries = [
+            (name, root / name)
+            for name in required + ("bin", "sbin", "lib")
+        ]
+        missing = [name for name, path in entries[:len(required)]
+                   if not os.path.lexists(path)]
+    else:
+        names = required + ("bin", "sbin", "lib")
+        missing = [name for name in names[:len(required)]
+                   if not _entry_exists(root_fd, name)]
+        entries = [(name, name) for name in names]
     if missing:
         raise RuntimeError("Buster rootfs missing required paths: " + ", ".join(missing))
-    for name in ("bin", "sbin", "lib"):
-        path = root / name
-        if os.path.lexists(path) and path.is_symlink():
-            _normalise_link_target(os.readlink(path), (name,))
+    for name, path in entries[len(required):]:
+        if root_fd is None:
+            if not os.path.lexists(path):
+                continue
+            mode = os.lstat(path).st_mode
+        else:
+            if not _entry_exists(root_fd, name):
+                continue
+            mode = os.stat(name, dir_fd=root_fd, follow_symlinks=False).st_mode
+        if not stat.S_ISLNK(mode):
+            continue
+        target = (os.readlink(path) if root_fd is None
+                  else os.readlink(name, dir_fd=root_fd))
+        _normalise_link_target(target, (name,))
+
+
+def _entry_exists(root_fd, name):
+    try:
+        os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        return True
+    except OSError:
+        return False
 
 
 def _load_release_metadata(path: str, version: str, arch: str):
@@ -626,6 +673,24 @@ def _active_root(state):
     version = state.get("version")
     _validate_version(version)
     return Path(RELEASES_DIR) / version / "rootfs"
+
+
+def _pin_active_root(state):
+    version = state.get("version")
+    _validate_version(version)
+    releases_fd = statedir.open_state_dir(RELEASES_DIR)
+    try:
+        root_fd = dirfd.descend_at(releases_fd, (version, "rootfs"))
+    except BaseException:
+        os.close(releases_fd)
+        raise
+    os.close(releases_fd)
+    try:
+        _validate_rootfs(_active_root(state), state["architecture"], root_fd)
+    except BaseException:
+        os.close(root_fd)
+        raise
+    return root_fd
 
 
 def _is_owned_directory(path: Path):
@@ -798,59 +863,123 @@ def _launcher_bindings(runtime_tmp, runtime_run, persistent_root,
     ]
 
 
-def _launcher_argv(root, bindings):
-    """The single supported proot invocation for Buster.
-
-    Kept as data rather than built inline at exec time so the exact command
-    the user runs can be asserted by a test and inspected without launching
-    anything.
-
-    ``--link2symlink`` is required on Android, where link(2) is refused:
-    proot turns the guest's hardlink attempts into symlinks rather than
-    failing package installation. ``-0`` is fake root inside the guest and
-    is explicitly *not* Android privilege.
-    """
+def _launcher_argv(bindings):
     return [
         "--link2symlink", "--kill-on-exit", "--sysvipc",
-        "-0", f"--rootfs={root}",
+        "-0", "--rootfs=.",
         *(f"--bind={binding}" for binding in bindings),
         "--cwd=/root",
     ]
 
 
-def _login():
-    state = _state()
+def _pinned_executable(root_fd, parts):
     try:
-        root = _active_root(state)
-        _validate_rootfs(root, state["architecture"])
+        directory_fd = dirfd.descend_at(root_fd, parts[:-1])
+    except OSError:
+        return False
+    try:
+        executable_fd, executable_st = dirfd.open_regular_at(
+            directory_fd, parts[-1], os.O_RDONLY
+        )
+    except OSError:
+        os.close(directory_fd)
+        return False
+    os.close(executable_fd)
+    os.close(directory_fd)
+    return bool(executable_st.st_mode & 0o111)
+
+
+def _launch_guest(inner, guest_parts):
+    with ContainerLock("buster", exclusive=False, command="buster-exec",
+                       inheritable=True):
+        _launch_guest_locked(inner, guest_parts)
+
+
+def _launch_guest_locked(inner, guest_parts):
+    state = _state()
+    root_fd = None
+    try:
+        root_fd = _pin_active_root(state)
+        if not _pinned_executable(root_fd, guest_parts):
+            guest_path = "/" + "/".join(guest_parts)
+            raise RuntimeError(
+                f"Buster rootfs does not contain an executable {guest_path}"
+            )
+        persistent_root, persistent_home, runtime_tmp, runtime_run = (
+            _ensure_persistent()
+        )
+        proot = Path(TERMUX_PREFIX) / "bin" / "proot"
+        if not proot.is_file() or not os.access(proot, os.X_OK):
+            raise RuntimeError(
+                f"TerminalP proot is not installed at {proot}; run pkg install proot"
+            )
+        bindings = _launcher_bindings(runtime_tmp, runtime_run,
+                                      persistent_root, persistent_home)
+        argv = [str(proot), *_launcher_argv(bindings), *inner]
+        previous_fd = os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fchdir(root_fd)
+            os.execvpe(proot, argv, _launcher_environment())
+        except BaseException:
+            os.fchdir(previous_fd)
+            raise
+        finally:
+            os.close(previous_fd)
     except (KeyError, RuntimeError, OSError) as exc:
         crit_error(f"Buster launch refused: {exc}")
         sys.exit(1)
-    persistent_root, persistent_home, runtime_tmp, runtime_run = _ensure_persistent()
-    proot = Path(TERMUX_PREFIX) / "bin" / "proot"
-    if not proot.is_file() or not os.access(proot, os.X_OK):
-        crit_error(f"TerminalP proot is not installed at {proot}; run pkg install proot")
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _exec_inner(tokens):
+    tokens = list(tokens)
+    if len(tokens) == 1 and tokens[0] in _EXEC_OPERATIONS:
+        return ["/usr/bin/buster", "exec", tokens[0]]
+    if (len(tokens) == 2 and tokens[0] in _SERVICE_OPERATIONS
+            and _SERVICE_NAME.fullmatch(tokens[1])):
+        return ["/usr/bin/buster", "exec", tokens[0], tokens[1]]
+    crit_error(
+        "buster exec supports only: status, services, capabilities, health, "
+        "ping, service-start <name>, service-restart <name>, service-status <name>"
+    )
+    sys.exit(1)
+
+
+def _exec(args):
+    if any(getattr(args, name, None) for name in (
+            "version", "architecture", "sha256", "release_metadata")):
+        crit_error("buster exec does not accept deployment options")
         sys.exit(1)
-    if not (root / "bin" / "bash").is_file():
-        crit_error("Buster rootfs does not contain an executable /bin/bash")
+    tokens = [args.archive, *(getattr(args, "exec_args", None) or [])]
+    if tokens[0] is None:
+        crit_error("buster exec requires a supported operation")
         sys.exit(1)
-    bindings = _launcher_bindings(runtime_tmp, runtime_run, persistent_root,
-                                  persistent_home)
-    argv = [str(proot), *_launcher_argv(root, bindings), "/bin/bash", "-l"]
-    # The guest environment is constructed rather than inherited, so no
-    # TerminalP variable can override Buster's own userspace.
-    os.execvpe(proot, argv, _launcher_environment())
+    _launch_guest(_exec_inner(tokens), ("usr", "bin", "buster"))
+
+
+def _login():
+    _launch_guest(["/bin/bash", "-l"], ("usr", "bin", "bash"))
 
 
 def command_buster(args):
     """Dispatch the TerminalP Buster deployment command."""
     action = args.buster_action
+    if action in ("install", "verify") and getattr(args, "exec_args", None):
+        crit_error(f"unknown buster action argument: {args.exec_args[0]}")
+        sys.exit(1)
     if action == "install":
         _install(args)
     elif action == "verify":
         _verify()
     elif action == "login":
+        if args.archive is not None or getattr(args, "exec_args", None):
+            crit_error("buster login does not accept positional arguments")
+            sys.exit(1)
         _login()
+    elif action == "exec":
+        _exec(args)
     else:
         crit_error(f"unknown buster action: {action}")
         sys.exit(1)

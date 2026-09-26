@@ -259,3 +259,45 @@ def test_required_args_for_switches_on_image_flag():
     # Every other command falls through to the static table.
     assert parser.required_args_for("install", SimpleNamespace()) == \
         parser.REQUIRED_ARGS["install"]
+
+
+def test_buster_exec_parses_exact_positional_operation_forms():
+    p = parser.build_parser()
+    for tokens in (
+        ["status"],
+        ["services"],
+        ["capabilities"],
+        ["health"],
+        ["ping"],
+        ["service-start", "buster-runtime"],
+        ["service-restart", "event-router"],
+        ["service-status", "scheduler.v2_1"],
+    ):
+        args, unknown = p.parse_known_args(["buster", "exec", *tokens])
+        assert args.buster_action == "exec"
+        assert args.archive == tokens[0]
+        assert args.exec_args == list(tokens[1:])
+        assert unknown == []
+
+
+def test_buster_exec_preserves_extra_tokens_for_command_rejection():
+    p = parser.build_parser()
+    args, unknown = p.parse_known_args(
+        ["buster", "exec", "service-start", "tdash", "--force"]
+    )
+    assert args.archive == "service-start"
+    assert args.exec_args == ["tdash"]
+    assert unknown == ["--force"]
+
+
+def test_buster_exec_leaves_deployment_options_visible_for_rejection():
+    p = parser.build_parser()
+    args, unknown = p.parse_known_args([
+        "buster", "exec", "health",
+        "--install-root", "/data/other",
+        "--env", "EVIL=1",
+    ])
+    assert args.buster_action == "exec"
+    assert args.archive == "health"
+    assert args.exec_args == ["/data/other"]
+    assert unknown == ["--install-root", "--env", "EVIL=1"]

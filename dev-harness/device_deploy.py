@@ -115,7 +115,7 @@ bindings = buster._launcher_bindings(runtime_tmp, runtime_run,
                                      persistent_root, persistent_home)
 launcher_env = buster._launcher_environment()
 proot = str(Path(constants.TERMUX_PREFIX) / "bin" / "proot")
-argv = [proot, *buster._launcher_argv(root, bindings), "/bin/bash", "-l"]
+argv = [proot, *buster._launcher_argv(bindings), "/bin/bash", "-l"]
 
 print("\n=== the single supported launcher argv ===")
 print("  " + " ".join(argv))
@@ -168,6 +168,7 @@ print("\n=== in-guest smoke test through the launcher ===")
 completed = subprocess.run(
     [*argv, "-c", SMOKE],
     env=launcher_env,
+    cwd=root,
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
     timeout=900,

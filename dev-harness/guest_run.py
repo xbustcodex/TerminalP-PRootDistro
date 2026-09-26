@@ -33,7 +33,7 @@ persistent_root, persistent_home, runtime_tmp, runtime_run = buster._ensure_pers
 bindings = buster._launcher_bindings(runtime_tmp, runtime_run,
                                      persistent_root, persistent_home)
 argv = [str(Path(constants.TERMUX_PREFIX) / "bin" / "proot"),
-        *buster._launcher_argv(root, bindings), "/bin/bash", "-l"]
+        *buster._launcher_argv(bindings), "/bin/bash", "-l"]
 
 print("rootfs  = %s" % root)
 print("active  = %s" % state)
@@ -43,6 +43,7 @@ print("-" * 72)
 completed = subprocess.run(
     [*argv, "-c", script],
     env=buster._launcher_environment(),
+    cwd=root,
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
     timeout=900,

@@ -1,9 +1,11 @@
 import argparse
 import errno
 import io
+import json
 import os
 import stat
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -450,14 +452,13 @@ def test_launcher_bindings_are_an_explicit_allowlist(tmp_path):
 
 
 def test_launcher_argv_is_fake_root_inside_the_guest(tmp_path):
-    root = tmp_path / "releases" / "0.3.2" / "rootfs"
     bindings = buster._launcher_bindings(
         tmp_path / "tmp", tmp_path / "run",
         tmp_path / "root", tmp_path / "home")
-    argv = buster._launcher_argv(root, bindings)
+    argv = buster._launcher_argv(bindings)
 
     assert "-0" in argv
-    assert f"--rootfs={root}" in argv
+    assert "--rootfs=." in argv
     # Android refuses link(2); proot must translate for the guest
     assert "--link2symlink" in argv
     assert "--cwd=/root" in argv
@@ -466,3 +467,302 @@ def test_launcher_argv_is_fake_root_inside_the_guest(tmp_path):
     for binding in bindings:
         assert f"--bind={binding}" in argv
     assert all(arg.startswith("--") or arg == "-0" for arg in argv)
+
+
+def make_active_buster(versions=("0.3.2",), *, with_buster=True, with_bash=False):
+    roots = {}
+    buster._ensure_state_dirs()
+    for version in versions:
+        root = Path(buster.RELEASES_DIR) / version / "rootfs"
+        for name in ("usr", "etc", "var", "tmp", "run", "dev", "proc",
+                     "sys", "home", "root", "usr/bin"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        if with_buster:
+            command = root / "usr" / "bin" / "buster"
+            command.write_text("#!/bin/sh\n", encoding="utf-8")
+            command.chmod(0o755)
+        if with_bash:
+            shell = root / "usr" / "bin" / "bash"
+            shell.write_text("#!/bin/sh\n", encoding="utf-8")
+            shell.chmod(0o755)
+        roots[version] = root
+    with open(buster.STATE_FILE, "w", encoding="utf-8") as stream:
+        json.dump({"version": versions[-1], "architecture": "arm64",
+                   "state": "active", "sha256": "a" * 64}, stream)
+    return roots
+
+
+def exec_args(operation, *rest):
+    return argparse.Namespace(buster_action="exec", archive=operation,
+                              exec_args=list(rest), version=None,
+                              architecture=None, sha256=None,
+                              release_metadata=None)
+
+
+def capture_buster_exec(monkeypatch):
+    seen = {}
+
+    def fake_execvpe(binary, argv, env):
+        seen["binary"] = str(binary)
+        seen["argv"] = list(argv)
+        seen["env"] = dict(env)
+        seen["cwd"] = os.stat(os.curdir)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(os, "execvpe", fake_execvpe)
+    return seen
+
+
+def prepare_terminalp(monkeypatch, tmp_path):
+    prefix = tmp_path / "terminalp"
+    proot = prefix / "bin" / "proot"
+    proot.parent.mkdir(parents=True)
+    proot.write_text("proot", encoding="utf-8")
+    proot.chmod(0o755)
+    monkeypatch.setattr(buster, "TERMUX_PREFIX", str(prefix))
+    monkeypatch.setattr(buster, "get_device_cpu_arch", lambda: "aarch64")
+
+
+@pytest.mark.parametrize("tokens,expected", [
+    (["status"], ["/usr/bin/buster", "exec", "status"]),
+    (["services"], ["/usr/bin/buster", "exec", "services"]),
+    (["capabilities"], ["/usr/bin/buster", "exec", "capabilities"]),
+    (["health"], ["/usr/bin/buster", "exec", "health"]),
+    (["ping"], ["/usr/bin/buster", "exec", "ping"]),
+    (["service-start", "buster-runtime"],
+     ["/usr/bin/buster", "exec", "service-start", "buster-runtime"]),
+    (["service-restart", "event-router"],
+     ["/usr/bin/buster", "exec", "service-restart", "event-router"]),
+    (["service-status", "scheduler.v2_1"],
+     ["/usr/bin/buster", "exec", "service-status", "scheduler.v2_1"]),
+])
+def test_exec_inner_exact_argv(tokens, expected):
+    assert buster._exec_inner(tokens) == expected
+
+
+@pytest.mark.parametrize("tokens", [
+    [],
+    ["start"],
+    ["status", "extra"],
+    ["service-start"],
+    ["service-start", "tdash", "--force"],
+    ["service-start", "-tdash"],
+    ["service-start", "../etc/passwd"],
+    ["service-start", "tdash;rm -rf /"],
+    ["service-start", "tdash$(id)"],
+    ["service-start", "tdash name"],
+    ["service-start", "tdash\nname"],
+    ["/bin/sh"],
+    ["-c", "echo unsafe"],
+])
+def test_exec_inner_rejects_every_unsupported_form(tokens):
+    with pytest.raises(SystemExit) as refused:
+        buster._exec_inner(tokens)
+    assert refused.value.code == 1
+
+
+def test_exec_uses_active_root_without_a_shell(tmp_path, monkeypatch):
+    roots = make_active_buster(("0.3.1", "0.3.2"))
+    prepare_terminalp(monkeypatch, tmp_path)
+    seen = capture_buster_exec(monkeypatch)
+
+    with pytest.raises(SystemExit) as exited:
+        buster._exec(exec_args("health"))
+
+    assert exited.value.code == 0
+    argv = seen["argv"]
+    assert argv[-3:] == ["/usr/bin/buster", "exec", "health"]
+    assert "--rootfs=." in argv
+    assert not any(token in ("/bin/bash", "/bin/sh", "sh", "-c", "-lc")
+                   for token in argv)
+    active_stat = os.stat(roots["0.3.2"])
+    assert (seen["cwd"].st_dev, seen["cwd"].st_ino) == (
+        active_stat.st_dev, active_stat.st_ino
+    )
+    assert str(roots["0.3.1"]) not in argv
+    assert str(roots["0.3.2"]) not in argv
+
+
+def test_exec_pins_the_selected_active_release(tmp_path, monkeypatch):
+    roots = make_active_buster(("0.3.1", "0.3.2"))
+    prepare_terminalp(monkeypatch, tmp_path)
+    seen = capture_buster_exec(monkeypatch)
+    active = Path(buster.RELEASES_DIR) / "0.3.2"
+    original = tmp_path / "active-before-swap"
+    persistent = buster._ensure_persistent
+
+    def swap_after_pin():
+        paths = persistent()
+        active.rename(original)
+        os.symlink(roots["0.3.1"], active, target_is_directory=True)
+        return paths
+
+    monkeypatch.setattr(buster, "_ensure_persistent", swap_after_pin)
+    expected_stat = os.stat(roots["0.3.2"])
+
+    with pytest.raises(SystemExit):
+        buster._exec(exec_args("status"))
+
+    assert (seen["cwd"].st_dev, seen["cwd"].st_ino) == (
+        expected_stat.st_dev, expected_stat.st_ino
+    )
+    assert active.is_symlink()
+    assert original.is_dir()
+
+
+@pytest.mark.parametrize("name,value", [
+    ("version", "0.3.2"),
+    ("architecture", "amd64"),
+    ("sha256", "a" * 64),
+    ("release_metadata", "/data/attacker.json"),
+])
+def test_exec_rejects_deployment_and_environment_override_options(name, value,
+                                                                 monkeypatch):
+    monkeypatch.setattr(os, "execvpe", lambda *a, **k: pytest.fail("exec"))
+    args = exec_args("health")
+    setattr(args, name, value)
+
+    with pytest.raises(SystemExit) as refused:
+        buster._exec(args)
+
+    assert refused.value.code == 1
+
+
+def test_exec_uses_only_environment_and_mount_allowlists(tmp_path, monkeypatch):
+    make_active_buster()
+    prepare_terminalp(monkeypatch, tmp_path)
+    seen = capture_buster_exec(monkeypatch)
+    monkeypatch.setenv("PREFIX", "/data/data/com.primetech.terminal/files/usr")
+    monkeypatch.setenv("LD_PRELOAD", "/data/lib/host.so")
+    monkeypatch.setenv("BUSTER_INSTALL_PATH", "/data/other")
+    monkeypatch.setenv("PROOT_VERBOSE", "1")
+
+    with pytest.raises(SystemExit):
+        buster._exec(exec_args("services"))
+
+    assert set(seen["env"]) == {
+        "HOME", "PATH", "TERM", "LANG", "LC_ALL", "TERMINALP_VERSION"
+    }
+    binds = [arg.removeprefix("--bind=") for arg in seen["argv"]
+             if arg.startswith("--bind=")]
+    assert binds == ["/dev", "/proc", "/sys",
+                     f"{Path(buster.PERSISTENT_DIR) / 'runtime' / 'tmp'}:/tmp",
+                     f"{Path(buster.PERSISTENT_DIR) / 'runtime' / 'run'}:/run",
+                     f"{Path(buster.PERSISTENT_DIR) / 'root'}:/root",
+                     f"{Path(buster.PERSISTENT_DIR) / 'home'}:/home"]
+
+
+@pytest.mark.parametrize("state", [
+    {},
+    {"version": "../escape", "architecture": "arm64"},
+    {"version": "0.3.2"},
+    {"version": "missing", "architecture": "arm64"},
+    {"version": "0.3.2", "architecture": "amd64"},
+])
+def test_exec_state_failure_stops_before_private_dirs_or_exec(
+        state, tmp_path, monkeypatch):
+    prepare_terminalp(monkeypatch, tmp_path)
+    monkeypatch.setattr(buster, "_state", lambda: state)
+    called = []
+    monkeypatch.setattr(buster, "_ensure_persistent",
+                        lambda: called.append("persistent"))
+    monkeypatch.setattr(os, "execvpe", lambda *a, **k: called.append("exec"))
+
+    with pytest.raises(SystemExit) as refused:
+        buster._exec(exec_args("health"))
+
+    assert refused.value.code == 1
+    assert called == []
+
+
+def test_exec_refuses_missing_or_non_regular_guest_command(tmp_path, monkeypatch):
+    make_active_buster(with_buster=False)
+    prepare_terminalp(monkeypatch, tmp_path)
+    monkeypatch.setattr(os, "execvpe", lambda *a, **k: pytest.fail("exec"))
+    with pytest.raises(SystemExit) as refused:
+        buster._exec(exec_args("health"))
+    assert refused.value.code == 1
+
+    root = Path(buster.RELEASES_DIR) / "0.3.2" / "rootfs"
+    command = root / "usr" / "bin" / "buster"
+    command.write_text("#!/bin/sh\n", encoding="utf-8")
+    command.chmod(0o755)
+    os.unlink(command)
+    os.mkdir(command)
+    with pytest.raises(SystemExit) as refused:
+        buster._exec(exec_args("health"))
+    assert refused.value.code == 1
+
+
+@pytest.mark.parametrize("payload", [
+    b"",
+    b"[]",
+    b'{"version":"../escape","architecture":"arm64"}',
+    b'{"version":"missing","architecture":"arm64"}',
+])
+def test_exec_refuses_invalid_persisted_state_file(payload, tmp_path, monkeypatch):
+    prepare_terminalp(monkeypatch, tmp_path)
+    buster._ensure_state_dirs()
+    with open(buster.STATE_FILE, "wb") as stream:
+        stream.write(payload)
+    monkeypatch.setattr(os, "execvpe", lambda *a, **k: pytest.fail("exec"))
+
+    with pytest.raises(SystemExit) as refused:
+        buster._exec(exec_args("health"))
+
+    assert refused.value.code == 1
+
+
+def test_exec_refuses_symlinked_private_bind_source(tmp_path, monkeypatch):
+    make_active_buster()
+    prepare_terminalp(monkeypatch, tmp_path)
+    target = tmp_path / "private-target"
+    target.mkdir()
+    private_root = Path(buster.PERSISTENT_DIR) / "root"
+    private_root.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(target, private_root, target_is_directory=True)
+    monkeypatch.setattr(os, "execvpe", lambda *a, **k: pytest.fail("exec"))
+
+    with pytest.raises(SystemExit) as refused:
+        buster._exec(exec_args("health"))
+
+    assert refused.value.code == 1
+    assert list(target.iterdir()) == []
+
+
+def test_exec_refuses_symlinked_active_release(tmp_path, monkeypatch):
+    prepare_terminalp(monkeypatch, tmp_path)
+    make_active_buster()
+    release = Path(buster.RELEASES_DIR) / "0.3.2"
+    target = tmp_path / "decoy"
+    target.mkdir()
+    release.rename(tmp_path / "original-release")
+    os.symlink(target, release, target_is_directory=True)
+    monkeypatch.setattr(os, "execvpe", lambda *a, **k: pytest.fail("exec"))
+
+    with pytest.raises(SystemExit) as refused:
+        buster._exec(exec_args("health"))
+    assert refused.value.code == 1
+
+
+def test_non_exec_buster_actions_reject_extra_positional_args(monkeypatch):
+    called = []
+    monkeypatch.setattr(buster, "_login", lambda: called.append("login"))
+    args = argparse.Namespace(buster_action="login", archive=None,
+                              exec_args=["unexpected"])
+    with pytest.raises(SystemExit):
+        buster.command_buster(args)
+    assert called == []
+
+
+def test_exec_adds_no_android_root_or_sudo_bridge(tmp_path, monkeypatch):
+    make_active_buster()
+    prepare_terminalp(monkeypatch, tmp_path)
+    seen = capture_buster_exec(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        buster._exec(exec_args("service-start", "buster-runtime"))
+
+    forbidden = ("su", "sudo", "magisk", "tsu", "root", "--root-id")
+    assert not any(token in forbidden for token in seen["argv"])
+    assert "-0" in seen["argv"]

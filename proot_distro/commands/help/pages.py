@@ -968,7 +968,7 @@ HELP_PAGES = {
     },
 
     "buster": {
-        "usage": "buster install|verify|login [OPTIONS]",
+        "usage": "buster install|verify|login|exec OPERATION [NAME]",
         "summary": (
             "Install and run a canonical Prime Tech Buster OS rootfs "
             "through TerminalP's existing PRoot-Distro runtime. Buster "
@@ -982,12 +982,16 @@ HELP_PAGES = {
             ("--sha256 [DIGEST]", "Required SHA-256 of the rootfs archive."),
             ("--release-metadata [FILE]",
              "Read version, architecture and SHA-256 from a published JSON metadata file."),
+            ("exec OPERATION [NAME]",
+             "Run a fixed non-shell guest operation through /usr/bin/buster."),
         ],
         "examples": [
             f"{PROGRAM_NAME} buster install buster-v0.3.2-arm64.tar "
                 "--version 0.3.2 --architecture arm64 --sha256 DIGEST",
             f"{PROGRAM_NAME} buster verify",
             f"{PROGRAM_NAME} buster login",
+            f"{PROGRAM_NAME} buster exec health",
+            f"{PROGRAM_NAME} buster exec service-status buster-runtime",
         ],
         "footer": [{
             "title": "PERSISTENCE AND LIMITATIONS",
