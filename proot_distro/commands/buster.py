@@ -41,13 +41,41 @@ _MAX_LINKS = 1_000_000
 _MAX_MEMBERS = 2_000_000
 _MAX_SYMLINK_HOPS = 40
 _MAX_ARCHIVE_BYTES = 64 * 1024 * 1024 * 1024
+# The service-name contract, shared verbatim with the guest. Buster OS 0.4.2's
+# packaged parser (`/opt/buster/lib/buster/exec.py`, verified in the ARM64
+# Bookworm release artifact
+# sha256:e130548757bb9ca487c4423d3cc54299734e5af7e399fc85071a05554dc87361)
+# accepts a name when the character class matches AND 1 <= len(name) <= 64.
+# The character class alone is not the whole contract: the packaged guest
+# applies the length ceiling too, and a host that forwarded an over-long name
+# would be relying on the guest to refuse it. This module is the trust
+# boundary, so it enforces both halves itself. `_exec_inner` cannot widen the
+# accepted set -- it can only refuse earlier.
 _SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_SERVICE_NAME_MIN = 1
+_SERVICE_NAME_MAX = 64
 _EXEC_OPERATIONS = frozenset(
     ("status", "services", "capabilities", "health", "ping")
 )
 _SERVICE_OPERATIONS = frozenset(
     ("service-start", "service-restart", "service-status")
 )
+
+
+def _is_valid_service_name(name) -> bool:
+    """The shared service-name grammar: character class *and* 1..64 length.
+
+    A verbatim mirror of ``is_valid_service_name`` in the packaged Buster
+    0.4.2 exec parser, so that a name this accepts is exactly a name the guest
+    accepts, and a name this refuses is refused before any guest process is
+    started.
+    """
+    if not isinstance(name, str):
+        return False
+    if not (_SERVICE_NAME_MIN <= len(name) <= _SERVICE_NAME_MAX):
+        return False
+    return _SERVICE_NAME.fullmatch(name) is not None
+
 
 # TerminalP fork contract marker. TerminalP pins this literal in
 # scripts/bootstrap-aarch64.manifest and PRIMETECH_PACKAGE_BUILD_CONFIG.sh and
@@ -937,9 +965,20 @@ def _exec_inner(tokens):
     tokens = list(tokens)
     if len(tokens) == 1 and tokens[0] in _EXEC_OPERATIONS:
         return ["/usr/bin/buster", "exec", tokens[0]]
-    if (len(tokens) == 2 and tokens[0] in _SERVICE_OPERATIONS
-            and _SERVICE_NAME.fullmatch(tokens[1])):
-        return ["/usr/bin/buster", "exec", tokens[0], tokens[1]]
+    if len(tokens) == 2 and tokens[0] in _SERVICE_OPERATIONS:
+        name = tokens[1]
+        if _is_valid_service_name(name):
+            return ["/usr/bin/buster", "exec", tokens[0], name]
+        # Say which half of the contract failed. A 65-character name is a
+        # valid name for the operation, so reporting it as an unsupported
+        # operation would send the caller looking in the wrong place.
+        if (isinstance(name, str) and _SERVICE_NAME.fullmatch(name)
+                and len(name) > _SERVICE_NAME_MAX):
+            crit_error(
+                f"service name is {len(name)} characters; the limit is "
+                f"{_SERVICE_NAME_MAX}"
+            )
+            sys.exit(1)
     crit_error(
         "buster exec supports only: status, services, capabilities, health, "
         "ping, service-start <name>, service-restart <name>, service-status <name>"

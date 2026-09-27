@@ -3,6 +3,7 @@ import errno
 import io
 import json
 import os
+import re
 import stat
 import tarfile
 from pathlib import Path
@@ -766,3 +767,220 @@ def test_exec_adds_no_android_root_or_sudo_bridge(tmp_path, monkeypatch):
     forbidden = ("su", "sudo", "magisk", "tsu", "root", "--root-id")
     assert not any(token in forbidden for token in seen["argv"])
     assert "-0" in seen["argv"]
+
+
+# --- shared service-name contract (Buster OS 0.4.2) -----------------------
+#
+# The guest is authoritative. This is `is_valid_service_name` copied verbatim
+# out of the packaged Buster 0.4.2 exec parser
+# (`opt/buster/lib/buster/exec.py`) in the ARM64 Bookworm release artifact
+# sha256:e130548757bb9ca487c4423d3cc54299734e5af7e399fc85071a05554dc87361:
+#
+#     SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+#     SERVICE_NAME_MIN = 1
+#     SERVICE_NAME_MAX = 64
+#
+#     def is_valid_service_name(name) -> bool:
+#         if not isinstance(name, str):
+#             return False
+#         if not (SERVICE_NAME_MIN <= len(name) <= SERVICE_NAME_MAX):
+#             return False
+#         return SERVICE_NAME.fullmatch(name) is not None
+#
+# It is mirrored here rather than imported so the suite stays offline and
+# hermetic; `test_the_host_validator_matches_the_packaged_guest_validator`
+# is what proves the mirror has not drifted, and
+# `test_the_host_validator_matches_the_real_packaged_artifact` re-checks the
+# mirror against the actual artifact whenever one is supplied.
+
+_GUEST_SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_GUEST_SERVICE_NAME_MIN = 1
+_GUEST_SERVICE_NAME_MAX = 64
+
+
+def guest_is_valid_service_name(name) -> bool:
+    """Verbatim mirror of the packaged Buster 0.4.2 guest validator."""
+    if not isinstance(name, str):
+        return False
+    if not (_GUEST_SERVICE_NAME_MIN <= len(name) <= _GUEST_SERVICE_NAME_MAX):
+        return False
+    return _GUEST_SERVICE_NAME.fullmatch(name) is not None
+
+
+# The grammar-valid names at each boundary the contract cares about, plus the
+# forms a caller might try to smuggle. `separators` are inside the character
+# class, so they must stay accepted: refusing them would narrow the contract
+# the guest actually implements.
+CONTRACT_NAMES = [
+    # length 1, and the separators the grammar allows in non-leading position
+    "a", "Z", "9", "runtime", "buster-runtime", "event.router_1",
+    "R2D2.C-3PO_v9", "1service", "a.b-c_d", "a..b", "a--b", "a__b", "9.a-b_c",
+    # length 64 -- the ceiling, which must be accepted
+    "x" * 64, "a" + "b" * 62 + "c",
+    "9" * 32 + "-" * 31 + "z",
+    # length 65 -- one past the ceiling, which must be refused host-side
+    "x" * 65, "a" + "b" * 63 + "c",
+    # empty
+    "",
+    # leading characters outside the class
+    "-runtime", ".runtime", "_runtime", "..", "---", "...",
+    # path and shell syntax
+    "../runtime", "runtime/child", "runtime\\child", "/runtime",
+    "runtime;id", "runtime|id", "runtime&", "runtime$(id)", "runtime`id`",
+    "runtime;rm -rf /", "runtime name", "runtime\nid", "runtime\tx",
+    # non-strings
+    None, 42, 3.5, True, ["runtime"], ("runtime",), {"runtime": 1},
+]
+
+
+def test_the_shared_contract_constants_are_the_guests():
+    assert buster._SERVICE_NAME.pattern == _GUEST_SERVICE_NAME.pattern
+    assert buster._SERVICE_NAME_MIN == _GUEST_SERVICE_NAME_MIN
+    assert buster._SERVICE_NAME_MAX == _GUEST_SERVICE_NAME_MAX
+    assert (buster._SERVICE_NAME_MIN, buster._SERVICE_NAME_MAX) == (1, 64)
+
+
+def test_the_closed_vocabulary_is_exactly_eight_operations():
+    assert set(buster._EXEC_OPERATIONS) == {
+        "status", "services", "capabilities", "health", "ping",
+    }
+    assert set(buster._SERVICE_OPERATIONS) == {
+        "service-start", "service-restart", "service-status",
+    }
+    assert len(buster._EXEC_OPERATIONS) == 5
+    assert len(buster._SERVICE_OPERATIONS) == 3
+    assert not (buster._EXEC_OPERATIONS & buster._SERVICE_OPERATIONS)
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("a", True),                                   # length 1
+    ("x" * 64, True),                              # length 64, the ceiling
+    ("a.b-c_d", True),                             # grammar separators
+    ("R2D2.C-3PO_v9", True),
+    ("a..b", True), ("a--b", True), ("a__b", True), ("9.a-b_c", True),
+    ("..", False), ("---", False),                 # separators may not lead
+    ("x" * 65, False),                             # length 65, over the ceiling
+    ("", False),                                   # empty
+    ("-runtime", False),                           # leading '-'
+    (".runtime", False),
+    ("../runtime", False),
+    ("runtime/child", False),
+    ("runtime;rm -rf /", False),                   # shell syntax
+    ("runtime$(id)", False),
+    ("runtime`id`", False),
+    ("runtime\nid", False),
+    (None, False), (42, False), (["runtime"], False),
+])
+def test_the_host_validator_enforces_the_shared_contract(name, expected):
+    assert buster._is_valid_service_name(name) is expected
+
+
+@pytest.mark.parametrize("name", CONTRACT_NAMES)
+def test_the_host_validator_matches_the_packaged_guest_validator(name):
+    # The whole point of the change: whatever the host accepts, the guest
+    # accepts, and whatever the host refuses the guest would have refused.
+    assert buster._is_valid_service_name(name) == \
+        guest_is_valid_service_name(name)
+
+
+def test_a_name_at_the_ceiling_reaches_the_guest_intact():
+    name = "x" * 64
+    for operation in ("service-start", "service-restart", "service-status"):
+        assert buster._exec_inner([operation, name]) == [
+            "/usr/bin/buster", "exec", operation, name,
+        ]
+
+
+def test_a_name_one_past_the_ceiling_is_refused_before_any_guest_process(
+        monkeypatch):
+    seen = capture_buster_exec(monkeypatch)
+    for operation in ("service-start", "service-restart", "service-status"):
+        with pytest.raises(SystemExit) as refused:
+            buster._exec_inner([operation, "x" * 65])
+        assert refused.value.code == 1
+    assert seen == {}, "no argv was built for an over-long name"
+
+
+def test_an_over_long_name_names_the_length_limit_not_the_operation(capsys):
+    with pytest.raises(SystemExit):
+        buster._exec_inner(["service-start", "x" * 65])
+    err = capsys.readouterr().err
+    assert "65 characters" in err
+    assert "64" in err
+    # The operation itself is supported, so it must not be reported as the
+    # problem -- that would point the caller at the wrong half of the contract.
+    assert "supports only" not in err
+
+
+def test_the_dispatcher_still_refuses_every_unsupported_form():
+    # Unchanged from v5.8.0-primetech.2: the length ceiling must not have
+    # widened, narrowed or reordered anything else.
+    for tokens in ([], ["start"], ["status", "extra"], ["service-start"],
+                   ["service-start", "tdash", "--force"],
+                   ["service-start", "-tdash"],
+                   ["service-start", "../etc/passwd"],
+                   ["service-start", "tdash;rm -rf /"],
+                   ["service-start", "tdash$(id)"],
+                   ["service-start", "tdash name"],
+                   ["service-start", "tdash\nname"],
+                   ["/bin/sh"], ["-c", "echo unsafe"]):
+        with pytest.raises(SystemExit) as refused:
+            buster._exec_inner(tokens)
+        assert refused.value.code == 1, tokens
+
+
+def test_the_guest_argv_is_still_constructed_and_never_caller_shaped(
+        tmp_path, monkeypatch):
+    make_active_buster()
+    prepare_terminalp(monkeypatch, tmp_path)
+    seen = capture_buster_exec(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        buster._exec(exec_args("service-status", "event.router_1"))
+
+    # The executable and the operation are fixed by this module; only the
+    # grammar-validated name is the caller's, and it is a discrete argv
+    # element, so it cannot become a path, a flag or a second command.
+    assert seen["argv"][-4:] == [
+        "/usr/bin/buster", "exec", "service-status", "event.router_1",
+    ]
+    # The proot binary is this module's own, at argv[0]; the caller never
+    # names it.
+    proot = str(Path(buster.TERMUX_PREFIX) / "bin" / "proot")
+    assert seen["argv"][0] == seen["binary"] == proot
+    assert "-0" in seen["argv"]
+    assert "--rootfs=." in seen["argv"]
+    assert seen["cwd"]  # fchdir'd onto the descriptor-pinned active root
+
+
+def test_the_host_validator_matches_the_real_packaged_artifact():
+    """Re-derive the guest contract from the real artifact when one is given.
+
+    Set BUSTER_ARM64_ARTIFACT to the Buster 0.4.2 ARM64 Bookworm tarball
+    (sha256:e1305487...7361) to prove that the mirror above -- and therefore
+    the host validator it is compared against -- still matches the bytes that
+    actually ship. Skipped when the artifact is not present so the suite stays
+    hermetic offline.
+    """
+    import hashlib
+
+    path = os.environ.get("BUSTER_ARM64_ARTIFACT")
+    if not path or not os.path.isfile(path):
+        pytest.skip("BUSTER_ARM64_ARTIFACT not set")
+    expected = ("e130548757bb9ca487c4423d3cc54299734e5af7e399fc85071a"
+                "05554dc87361")
+    with open(path, "rb") as handle:
+        blob = handle.read()
+    assert hashlib.sha256(blob).hexdigest() == expected
+
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as archive:
+        source = archive.extractfile(
+            archive.getmember("opt/buster/lib/buster/exec.py")
+        ).read().decode("utf-8")
+
+    pattern = re.search(
+        r'SERVICE_NAME\s*=\s*re\.compile\(r"([^"]+)"\)', source).group(1)
+    assert pattern == _GUEST_SERVICE_NAME.pattern == buster._SERVICE_NAME.pattern
+    assert int(re.search(
+        r"SERVICE_NAME_MAX\s*=\s*(\d+)", source).group(1)) == 64
+    assert buster._SERVICE_NAME_MAX == 64
