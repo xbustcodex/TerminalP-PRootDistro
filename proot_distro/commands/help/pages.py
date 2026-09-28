@@ -992,6 +992,7 @@ HELP_PAGES = {
             f"{PROGRAM_NAME} buster login",
             f"{PROGRAM_NAME} buster exec health",
             f"{PROGRAM_NAME} buster exec service-status buster-runtime",
+            f"{PROGRAM_NAME} buster exec present",
         ],
         "footer": [{
             "title": "PERSISTENCE AND LIMITATIONS",

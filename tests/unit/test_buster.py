@@ -548,6 +548,7 @@ def prepare_terminalp(monkeypatch, tmp_path):
     (["capabilities"], ["/usr/bin/buster", "exec", "capabilities"]),
     (["health"], ["/usr/bin/buster", "exec", "health"]),
     (["ping"], ["/usr/bin/buster", "exec", "ping"]),
+    (["present"], ["/usr/bin/buster", "exec", "present"]),
     (["service-start", "buster-runtime"],
      ["/usr/bin/buster", "exec", "service-start", "buster-runtime"]),
     (["service-restart", "event-router"],
@@ -563,6 +564,16 @@ def test_exec_inner_exact_argv(tokens, expected):
     [],
     ["start"],
     ["status", "extra"],
+    # `present` names no target: any argument form is refused outright rather
+    # than forwarded, so no URL, path or argv can reach the host bridge.
+    ["present", "http://evil.example"],
+    ["present", "http://127.0.0.1:8468"],
+    ["present", "--url"],
+    ["present", "buster-runtime"],
+    ["present", "http://127.0.0.1:8468", "extra"],
+    ["present", "-c", "am start -n com.evil/.Steal"],
+    ["present-open-url"],
+    ["present-url"],
     ["service-start"],
     ["service-start", "tdash", "--force"],
     ["service-start", "-tdash"],
@@ -1005,14 +1016,14 @@ def test_the_shared_contract_constants_are_the_guests():
     assert (buster._SERVICE_NAME_MIN, buster._SERVICE_NAME_MAX) == (1, 64)
 
 
-def test_the_closed_vocabulary_is_exactly_eight_operations():
+def test_the_closed_vocabulary_is_exactly_nine_operations():
     assert set(buster._EXEC_OPERATIONS) == {
-        "status", "services", "capabilities", "health", "ping",
+        "status", "services", "capabilities", "health", "ping", "present",
     }
     assert set(buster._SERVICE_OPERATIONS) == {
         "service-start", "service-restart", "service-status",
     }
-    assert len(buster._EXEC_OPERATIONS) == 5
+    assert len(buster._EXEC_OPERATIONS) == 6
     assert len(buster._SERVICE_OPERATIONS) == 3
     assert not (buster._EXEC_OPERATIONS & buster._SERVICE_OPERATIONS)
 

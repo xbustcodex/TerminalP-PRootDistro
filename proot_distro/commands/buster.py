@@ -55,7 +55,7 @@ _SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _SERVICE_NAME_MIN = 1
 _SERVICE_NAME_MAX = 64
 _EXEC_OPERATIONS = frozenset(
-    ("status", "services", "capabilities", "health", "ping")
+    ("status", "services", "capabilities", "health", "ping", "present")
 )
 _SERVICE_OPERATIONS = frozenset(
     ("service-start", "service-restart", "service-status")
@@ -984,7 +984,8 @@ def _exec_inner(tokens):
             sys.exit(1)
     crit_error(
         "buster exec supports only: status, services, capabilities, health, "
-        "ping, service-start <name>, service-restart <name>, service-status <name>"
+        "ping, present, service-start <name>, service-restart <name>, "
+        "service-status <name>"
     )
     sys.exit(1)
 
