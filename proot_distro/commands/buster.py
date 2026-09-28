@@ -944,15 +944,18 @@ def _launch_guest_locked(inner, guest_parts):
         bindings = _launcher_bindings(runtime_tmp, runtime_run,
                                       persistent_root, persistent_home)
         argv = [str(proot), *_launcher_argv(bindings), *inner]
-        previous_fd = os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fchdir(root_fd)
-            os.execvpe(proot, argv, _launcher_environment())
-        except BaseException:
-            os.fchdir(previous_fd)
-            raise
-        finally:
-            os.close(previous_fd)
+        # There is no cwd to save. A successful execvpe() replaces this
+        # process image, so nothing after it can observe or restore an
+        # inherited working directory; the only reason to hold one would be
+        # to undo a launch that failed, and the process is about to exit in
+        # that case anyway. Keeping it cost a real failure: the app process
+        # that hosts TerminalP's bridge inherits cwd=/data, which the
+        # untrusted_app domain may not search, so os.open(os.curdir) failed
+        # with EACCES and the guest was never reached. --rootfs=. is resolved
+        # by proot from the fd-pinned root_fd this fchdir selects, so it never
+        # depended on the caller's directory to begin with.
+        os.fchdir(root_fd)
+        os.execvpe(proot, argv, _launcher_environment())
     except (KeyError, RuntimeError, OSError) as exc:
         crit_error(f"Buster launch refused: {exc}")
         sys.exit(1)

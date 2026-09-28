@@ -1,10 +1,13 @@
 import argparse
+import contextlib
 import errno
 import io
 import json
 import os
 import re
+import shutil
 import stat
+import tempfile
 import tarfile
 from pathlib import Path
 
@@ -501,13 +504,28 @@ def exec_args(operation, *rest):
 
 
 def capture_buster_exec(monkeypatch):
+    """Capture the exec the launcher performs, and stand in for the process
+    replacement a real execvpe performs.
+
+    The launcher fchdir()s into the fd-pinned rootfs and then execs. A real
+    execvpe never returns, so that directory change is the process's last act.
+    This mock *does* return, so putting the test process back is the mock's
+    job, not the production code's: otherwise every later test in the session
+    would inherit a cwd pointing into a temporary rootfs. This restores the
+    test's own state only; the launcher performs no cwd restoration, and
+    nothing here hides that.
+    """
     seen = {}
+    here = os.dup(os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY))
 
     def fake_execvpe(binary, argv, env):
-        seen["binary"] = str(binary)
-        seen["argv"] = list(argv)
-        seen["env"] = dict(env)
-        seen["cwd"] = os.stat(os.curdir)
+        try:
+            seen["binary"] = str(binary)
+            seen["argv"] = list(argv)
+            seen["env"] = dict(env)
+            seen["cwd"] = os.stat(os.curdir)
+        finally:
+            os.fchdir(here)
         raise SystemExit(0)
 
     monkeypatch.setattr(os, "execvpe", fake_execvpe)
@@ -609,6 +627,153 @@ def test_exec_pins_the_selected_active_release(tmp_path, monkeypatch):
     )
     assert active.is_symlink()
     assert original.is_dir()
+
+
+# -- the real-device condition: an inherited cwd the process cannot search ----
+#
+# TerminalP's BusterBridgeService runs inside the Android app process, which
+# the platform starts with cwd=/data. The untrusted_app SELinux domain may not
+# search that directory, so anything that resolves the inherited working
+# directory fails with EACCES before the guest is ever reached. The launcher
+# used to open os.curdir to save a cwd it could not restore anyway, because a
+# successful execvpe() replaces the process image. These tests pin the real
+# condition and the corrected behaviour, without touching the kernel's
+# permissions: the unsearchable-ness is supplied by the test, so it is
+# reproducible on any host.
+
+
+@contextlib.contextmanager
+def _inherited_unsearchable_cwd():
+    """Yield a cwd that is inherited but can no longer be searched or reopened.
+
+    The device's condition is not "chdir into a forbidden path": the kernel
+    hands the process a cwd it is already inside, and policy then denies the
+    domain `search` on it. So the directory is entered while it is still
+    reachable and only then made unsearchable. From inside, the process still
+    holds a valid cwd, while `open(".", O_DIRECTORY)` returns EACCES -- exactly
+    what `os.open(os.curdir, ...)` did on the Pixel.
+
+    The directory is created outside tmp_path so that denying it does not also
+    break pytest's own tree cleanup, and it is removed explicitly afterwards.
+    The harness holds a descriptor to its original directory, so it can return
+    without ever resolving the denied path.
+    """
+    rescue = os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY)
+    inherited = Path(tempfile.mkdtemp(prefix="inherited-cwd-"))
+    try:
+        os.chdir(inherited)
+        inherited.chmod(0o000)   # deny search/traverse; cwd already inherited
+        yield inherited
+    finally:
+        inherited.chmod(0o700)
+        os.fchdir(rescue)
+        os.close(rescue)
+        shutil.rmtree(inherited, ignore_errors=True)
+
+
+def test_inherited_unsearchable_cwd_really_fails_to_reopen():
+    """The precondition: an inherited cwd that os.open('.') cannot open.
+
+    This is the device's EACCES, reproduced on any host without touching
+    kernel policy.
+    """
+    with _inherited_unsearchable_cwd():
+        assert os.getcwd() is not None
+        with pytest.raises(PermissionError) as denied:
+            fd = os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY)
+            os.close(fd)
+        assert denied.value.errno == errno.EACCES
+
+
+def test_exec_reaches_guest_from_an_unsearchable_inherited_cwd(
+        tmp_path, monkeypatch):
+    """The Android binder condition: the launcher still reaches the guest.
+
+    This is the whole point of the fix. Under the old implementation the
+    launch died at `os.open(os.curdir, ...)` with EACCES and reported
+    "Buster launch refused: [Errno 13] Permission denied: '.'". Here the
+    inherited cwd is equally unsearchable, and exec is still reached.
+    """
+    roots = make_active_buster(("0.4.0",))
+    prepare_terminalp(monkeypatch, tmp_path)
+    seen = capture_buster_exec(monkeypatch)
+
+    with _inherited_unsearchable_cwd():
+        assert os.getcwd()  # the kernel still reports the inherited cwd
+        with pytest.raises(SystemExit) as exited:
+            buster._exec(exec_args("status"))
+
+    assert exited.value.code == 0
+    assert seen["argv"][-3:] == ["/usr/bin/buster", "exec", "status"]
+    active_stat = os.stat(roots["0.4.0"])
+    assert (seen["cwd"].st_dev, seen["cwd"].st_ino) == (
+        active_stat.st_dev, active_stat.st_ino
+    )
+
+
+def test_launch_does_not_depend_on_the_inherited_cwd():
+    """No inherited-cwd machinery remains in the launch path.
+
+    Checked over the parsed syntax tree rather than the raw text, so the
+    comment that explains the removal cannot satisfy or break the assertion.
+    """
+    import ast
+
+    tree = ast.parse(Path(buster.__file__).read_text(encoding="utf-8"))
+    launch = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_launch_guest_locked"
+    )
+    used = {
+        node.attr
+        for node in ast.walk(launch)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    }
+    assert "curdir" not in used
+    called = {
+        node.func.attr
+        for node in ast.walk(launch)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    # `os.open(os.curdir, ...)` would have shown up as the `curdir` attribute
+    # above, so its absence is what proves the dependency is gone.
+    assert {"fchdir", "execvpe"} <= called
+
+
+def test_execvpe_failure_propagates_without_cwd_restoration(
+        tmp_path, monkeypatch):
+    """A launch that cannot exec still fails closed.
+
+    The contract is no longer "the caller's cwd is restored"; it is that a
+    failed launch is reported and the operation does not succeed. This asserts
+    that, and that nothing swallows the OSError.
+    """
+    make_active_buster(("0.4.0",))
+    prepare_terminalp(monkeypatch, tmp_path)
+
+    here = os.dup(os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY))
+
+    def failing_execvpe(binary, argv, env):
+        # The launcher has already fchdir'd into the rootfs by this point, and
+        # it deliberately does not put the test process back -- production no
+        # longer restores a cwd. Since this mock returns, the test harness
+        # owns that cleanup.
+        try:
+            raise OSError(errno.ENOENT, "no such file", str(binary))
+        finally:
+            os.fchdir(here)
+
+    monkeypatch.setattr(os, "execvpe", failing_execvpe)
+
+    with pytest.raises(SystemExit) as refused:
+        buster._exec(exec_args("status"))
+
+    assert refused.value.code == 1
+    # Nothing escaped: the OSError was reported through the typed refusal
+    # path rather than propagated or silently ignored.
 
 
 @pytest.mark.parametrize("name,value", [
