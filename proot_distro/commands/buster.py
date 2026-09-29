@@ -55,8 +55,16 @@ _SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _SERVICE_NAME_MIN = 1
 _SERVICE_NAME_MAX = 64
 _EXEC_OPERATIONS = frozenset(
-    ("status", "services", "capabilities", "health", "ping", "present")
+    ("status", "services", "capabilities", "health", "ping", "present",
+     "deployment")
 )
+# Operations taking exactly ONE argument drawn from a closed enum. A value
+# outside the set is refused here, before any guest process is started, so an
+# arbitrary string can never become a guest argument.
+_VIEW_OPERATIONS = frozenset(("read",))
+_VIEW_VALUES = frozenset((
+    "goals", "memory", "attention", "activity", "device", "settings", "jobs",
+))
 _SERVICE_OPERATIONS = frozenset(
     ("service-start", "service-restart", "service-status")
 )
@@ -968,6 +976,14 @@ def _exec_inner(tokens):
     tokens = list(tokens)
     if len(tokens) == 1 and tokens[0] in _EXEC_OPERATIONS:
         return ["/usr/bin/buster", "exec", tokens[0]]
+    if len(tokens) == 2 and tokens[0] in _VIEW_OPERATIONS:
+        view = tokens[1]
+        if view in _VIEW_VALUES:
+            return ["/usr/bin/buster", "exec", tokens[0], view]
+        crit_error(
+            "read accepts only: " + ", ".join(sorted(_VIEW_VALUES))
+        )
+        sys.exit(1)
     if len(tokens) == 2 and tokens[0] in _SERVICE_OPERATIONS:
         name = tokens[1]
         if _is_valid_service_name(name):
@@ -984,8 +1000,8 @@ def _exec_inner(tokens):
             sys.exit(1)
     crit_error(
         "buster exec supports only: status, services, capabilities, health, "
-        "ping, present, service-start <name>, service-restart <name>, "
-        "service-status <name>"
+        "ping, present, deployment, read <view>, service-start <name>, "
+        "service-restart <name>, service-status <name>"
     )
     sys.exit(1)
 
